@@ -1,0 +1,4 @@
+{
+  "version": "2.0.0",
+  "tasks": [{"label":"Road AI: tests","type":"shell","command":"node --test tests/*.test.mjs","group":"test","problemMatcher":[]}]
+}

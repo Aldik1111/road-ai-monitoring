@@ -1,0 +1,33 @@
+# Creates a PAID service and disk only after you apply this Blueprint in Render.
+services:
+  - type: web
+    name: road-ai-monitoring
+    runtime: node
+    plan: 0.5c-512mb
+    numInstances: 1
+    buildCommand: npm run check
+    startCommand: node server.mjs
+    healthCheckPath: /healthz
+    disk:
+      name: road-ai-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_VERSION
+        value: 24.21.0
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /var/data/road-ai
+      - key: MAX_VIDEO_MB
+        value: 32
+      - key: OPERATOR_PASSWORD
+        generateValue: true
+      - key: DISPATCHER_PASSWORD
+        generateValue: true
+      - key: WORKER_PASSWORD
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        generateValue: true

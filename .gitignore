@@ -10,3 +10,4 @@ Thumbs.db
 data/private/
 uploads/
 *.log
+.tools/
