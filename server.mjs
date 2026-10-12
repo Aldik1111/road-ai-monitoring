@@ -1,5 +1,6 @@
 import './lib/env.mjs';
 import http from 'node:http';
+import sharp from 'sharp';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, existsSync, statSync, createReadStream } from 'node:fs';
@@ -45,7 +46,7 @@ function event(entity, action, user, from, to, reason='') {
 }
 async function body(req) {
   const pathname=new URL(req.url,'http://localhost').pathname;
-  const limit = pathname === '/api/trips' ? (config.maxVideoMB+6)*1024*1024 : pathname.includes('/photo') ? 10*1024*1024 : 1024*1024;
+  const limit = pathname === '/api/trips' ? (config.maxVideoMB+6)*1024*1024 : pathname.includes('/photo') ? 11*1024*1024 : 1024*1024;
   const chunks=[]; let size=0;
   for await (const chunk of req) { size+=chunk.length; requireValue(size<=limit,'FILE_TOO_LARGE',413); chunks.push(chunk); }
   const bytes=Buffer.concat(chunks);
@@ -89,7 +90,7 @@ async function processTrip(id) {
       frames=[1000,1600,7000,7600,13000].filter(ms=>ms/1000<trip.duration).map((ms,i)=>({id: id+'-f'+i,trip_id:id,time_ms:ms,frame_uri:'/demo-frame.svg',bbox:{x:.37,y:.56,width:.24,height:.18},class:'pothole',score:.72+i*.04,model_version:'demo-fixture-v1',origin:'test'}));
     }else{
       requireValue(detectorAvailable,'DETECTOR_UNAVAILABLE');
-      const result=await detectVideo({id,video:join(data,'files',id+'.mp4'),output:join(data,'files'),duration:trip.duration},progress=>{
+      const result=await detectVideo({id,photo:trip.media_type==='photo'?join(data,'files',id+'.jpg'):null,video:join(data,'files',id+'.mp4'),output:join(data,'files'),duration:trip.duration},progress=>{
         trip.processed_frames=progress.processed_frames;trip.progress=progress.progress;save('trip',trip);
       });
       frames=result.frames;trip.processed_frames=result.processed_frames;trip.sampled_duration=result.sampled_duration;trip.model_version=MODEL.version;
@@ -101,7 +102,7 @@ async function processTrip(id) {
       for(const [index,group] of groups.entries()){
         const candidateId=id+'-c'+index;
         if(all('candidate').some(c=>c.id===candidateId))continue;
-        const best=group.reduce((a,b)=>a.score>b.score?a:b),captured_at=new Date(Date.parse(trip.started_at)+best.time_ms).toISOString(),pos=positionAt(trip.gps,captured_at);
+        const best=group.reduce((a,b)=>a.score>b.score?a:b),captured_at=new Date(Date.parse(trip.started_at)+best.time_ms).toISOString(),pos=trip.media_type==='photo'?{position:trip.manual_position,quality:'manual'}:positionAt(trip.gps,captured_at);
         save('candidate',{id:candidateId,trip_id:id,frame_detection_ids:group.map(f=>f.id),best_frame:best,captured_at,original_position:pos.position,edited_position:null,position_quality:pos.quality,review_status:'pending',linked_defect_id:null,origin:trip.demo?'test':'model',history:[]});
       }
       trip.status='ready';trip.progress=100;trip.result_complete=true;trip.detection_count=frames.length;trip.candidate_count=groups.length;trip.completed_at=now();trip.error=null;save('trip',trip);db.exec('COMMIT');
@@ -155,15 +156,25 @@ const server=http.createServer(async(req,res)=>{
     const cached=db.prepare('SELECT path,result FROM requests WHERE actor=? AND key=?').get(user.id,key);
     if(cached) {requireValue(cached.path===path,'INVALID_INPUT');return json(res,200,JSON.parse(cached.result));}
     // Finish asynchronous file reads before entering the synchronous SQLite transaction.
-    let videoBytes, gpsText, photoBytes;
+    let videoBytes, gpsText, photoBytes, normalizedPhoto;
     if(b instanceof FormData) {
       if(path==='/api/trips') {
         const video=b.get('video'),gps=b.get('gps');
         if(video && typeof video.arrayBuffer==='function') videoBytes=Buffer.from(await video.arrayBuffer());
         if(gps && typeof gps.text==='function') gpsText=await gps.text();
-      } else if(path.endsWith('/photo')) {
+      } else if(path.endsWith('/photo') || path==='/api/photos') {
         const photo=b.get('photo');if(photo && typeof photo.arrayBuffer==='function')photoBytes=Buffer.from(await photo.arrayBuffer());
       }
+    }
+    if(path==='/api/photos'){
+      allow(user,'operator','admin');requireValue(b instanceof FormData,'INVALID_INPUT');
+      const file=b.get('photo');requireValue(file && /\.(jpe?g|png)$/i.test(file.name||'') && photoBytes?.length>0,'INVALID_FILE');
+      requireValue(photoBytes.length<=10*1024*1024,'FILE_TOO_LARGE',413);
+      try{
+        const meta=await sharp(photoBytes,{limitInputPixels:40000000}).metadata();
+        requireValue(['jpeg','png'].includes(meta.format) && (meta.pages||1)===1,'INVALID_FILE');
+        normalizedPhoto=await sharp(photoBytes,{limitInputPixels:40000000}).rotate().resize({width:2560,height:2560,fit:'inside',withoutEnlargement:true}).flatten({background:'#727272'}).jpeg({quality:90}).toBuffer();
+      }catch{throw new AppError('INVALID_FILE');}
     }
     // Another upload with the same key may have completed during the file reads.
     const completed=db.prepare('SELECT path,result FROM requests WHERE actor=? AND key=?').get(user.id,key);
@@ -171,7 +182,17 @@ const server=http.createServer(async(req,res)=>{
     let result;
     db.exec('BEGIN IMMEDIATE');
     try {
-      if(path==='/api/trips' && req.method==='POST') {
+      if(path==='/api/photos' && req.method==='POST'){
+        allow(user,'operator','admin');
+        const latText=String(b.get('lat')||'').trim(),lonText=String(b.get('lon')||'').trim(),lat=Number(latText),lon=Number(lonText);
+        requireValue(latText && lonText && Number.isFinite(lat) && Number.isFinite(lon) && Math.abs(lat)<=90 && Math.abs(lon)<=180,'INVALID_INPUT');
+        const route_name=String(b.get('route_name')||'').trim(),started_at=timestamp(b.get('started_at'));
+        requireValue(route_name.length>0 && route_name.length<=120);
+        const id=randomUUID(),photo_uri='/files/'+id+'.jpg';
+        writeFileSync(join(data,'files',id+'.jpg'),normalizedPhoto);
+        result={id,media_type:'photo',photo_uri,manual_position:{lat,lon},started_at,duration:0,route_name,camera_description:'',gps:[],demo:false,status:'queued',created_at:now(),error:null,history:[]};
+        event(result,'upload',user,null,'queued');save('trip',result);
+      }else if(path==='/api/trips' && req.method==='POST') {
         allow(user,'operator','admin');requireValue(b instanceof FormData,'INVALID_INPUT');
         const video=b.get('video'),gpsFile=b.get('gps');
         requireValue(video && typeof video.arrayBuffer==='function' && /\.mp4$/i.test(video.name) && video.size>12,'INVALID_FILE');

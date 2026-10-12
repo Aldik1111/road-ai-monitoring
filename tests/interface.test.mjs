@@ -29,7 +29,7 @@ test('all screens render in both languages with empty and populated server state
      lang=locale;user=null;render();
      for(const role of ['operator','dispatcher','worker','admin']) {
        user={id:role,role};
-       for(const screen of ['overview','trips','upload','queue','candidate','orders','order','trip','assistant']) {
+       for(const screen of ['overview','trips','upload','queue','candidate','orders','order','trip','assistant','photoUpload']) {
          page=screen;selected=screen==='candidate'?c.id:screen==='order'?o.id:trip.id;
          render();
          if(document.querySelector('#app').innerHTML.includes('<script>unsafe</script>'))throw new Error('Unescaped user content');

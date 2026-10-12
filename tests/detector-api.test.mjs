@@ -7,6 +7,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {randomUUID} from 'node:crypto';
 import ffmpeg from 'ffmpeg-static';
+import sharp from 'sharp';
 import {modelReady,MODEL} from '../lib/model.mjs';
 
 test('real video upload and GPS → async detector → persisted empty result; retry and web responsiveness',{skip:!modelReady(),timeout:30000},async()=>{
@@ -26,6 +27,17 @@ test('real video upload and GPS → async detector → persisted empty result; r
   const uploaded=await call('/api/trips','POST',form);assert.equal(uploaded.status,200);
   let ready;for(let i=0;i<100;i++){ready=(await call('/api/trips/'+uploaded.data.id)).data;assert.notEqual(ready.status,'failed',ready.error);assert.equal((await call('/healthz')).status,200);if(ready.status==='ready')break;await new Promise(r=>setTimeout(r,100));}
   assert.equal(ready.status,'ready');assert.equal(ready.demo,false);assert.equal(ready.model_version,MODEL.version);assert.equal(ready.candidate_count,0);assert.equal(ready.progress,100);assert.equal(ready.processed_frames,4);
+  const image=await sharp({create:{width:800,height:450,channels:3,background:'#000000'}}).png().toBuffer();
+  function photo(bytes=image){const f=new FormData();f.set('photo',new Blob([bytes],{type:'image/png'}),'road.png');f.set('lat','44.8');f.set('lon','65.4');f.set('route_name','Photo test');f.set('started_at','2026-10-12T04:00:00Z');return f;}
+  assert.equal((await call('/api/photos','POST',photo(Buffer.from('invalid')))).status,400);
+  const badCoords=photo();badCoords.set('lat','');assert.equal((await call('/api/photos','POST',badCoords)).status,400);
+  const savedCookie=cookie;cookie=(await call('/api/login','POST',{username:'worker',password:'RoadDemo2026!'})).cookie;
+  assert.equal((await call('/api/photos','POST',photo())).status,403);cookie=savedCookie;
+  const uploadedPhoto=await call('/api/photos','POST',photo());assert.equal(uploadedPhoto.status,200);assert.equal(uploadedPhoto.data.media_type,'photo');assert.deepEqual(uploadedPhoto.data.manual_position,{lat:44.8,lon:65.4});
+  let photoReady;for(let i=0;i<100;i++){photoReady=(await call('/api/trips/'+uploadedPhoto.data.id)).data;assert.notEqual(photoReady.status,'failed',photoReady.error);if(photoReady.status==='ready')break;await new Promise(r=>setTimeout(r,100));}
+  assert.equal(photoReady.status,'ready');assert.equal(photoReady.processed_frames,1);assert.equal(photoReady.candidate_count,0);assert.equal(photoReady.demo,false);
+  const photoResponse=await fetch(base+photoReady.photo_uri,{headers:{cookie}});assert.equal(photoResponse.status,200);
+  const metadata=await sharp(Buffer.from(await photoResponse.arrayBuffer())).metadata();assert.equal(metadata.format,'jpeg');assert.equal(metadata.exif,undefined);
   await call('/api/trips/'+ready.id+'/retry','POST',{});await new Promise(r=>setTimeout(r,650));
   const state=(await call('/api/state')).data;assert.equal(state.trips[0].status,'ready');assert.equal(state.candidates.length,0);
  }finally{if(child&&child.exitCode===null){const exited=once(child,'exit');child.kill();await exited;}rmSync(dir,{recursive:true,force:true});}
