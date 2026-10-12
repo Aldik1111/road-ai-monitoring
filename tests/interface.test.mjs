@@ -3,8 +3,19 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {readFileSync} from 'node:fs';
 
+test('missing chat script does not prevent login or navigation',()=>{
+ const elements={'#app':{innerHTML:''}};
+ const context={localStorage:{getItem:()=> 'ru'},document:{documentElement:{},querySelector:s=>elements[s]||null,addEventListener:()=>{}},console};
+ vm.createContext(context);
+ vm.runInContext(readFileSync('public/app.js','utf8').split('try{publicConfig=await api')[0],context);
+ vm.runInContext("render();",context);
+ assert.match(elements['#app'].innerHTML,/login-form/);
+ vm.runInContext("user={id:'operator',role:'operator'};page='assistant';render();",context);
+ assert.match(elements['#app'].innerHTML,/Перезапустите сервер/);
+});
+
 test('all screens render in both languages with empty and populated server state',()=>{
- const source=readFileSync('public/app.js','utf8').split('try{publicConfig=await api')[0];
+ const source=readFileSync('public/assistant-ui.js','utf8')+'\n'+readFileSync('public/app.js','utf8').split('try{publicConfig=await api')[0];
  const elements={'#app':{innerHTML:''},'#toast':{style:{}}};
  const context={localStorage:{getItem:()=>null},document:{documentElement:{},querySelector:s=>elements[s]||null,addEventListener:()=>{}},setTimeout:()=>{},console};
  vm.createContext(context);vm.runInContext(source,context);
@@ -18,7 +29,7 @@ test('all screens render in both languages with empty and populated server state
      lang=locale;user=null;render();
      for(const role of ['operator','dispatcher','worker','admin']) {
        user={id:role,role};
-       for(const screen of ['overview','trips','upload','queue','candidate','orders','order','trip']) {
+       for(const screen of ['overview','trips','upload','queue','candidate','orders','order','trip','assistant']) {
          page=screen;selected=screen==='candidate'?c.id:screen==='order'?o.id:trip.id;
          render();
          if(document.querySelector('#app').innerHTML.includes('<script>unsafe</script>'))throw new Error('Unescaped user content');

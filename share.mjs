@@ -1,3 +1,4 @@
+import './lib/env.mjs';
 import {spawn} from 'node:child_process';
 import {createServer} from 'node:net';
 import {mkdirSync,existsSync,readFileSync,writeFileSync} from 'node:fs';

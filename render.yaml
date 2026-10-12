@@ -5,7 +5,7 @@ services:
     runtime: node
     plan: 0.5c-512mb
     numInstances: 1
-    buildCommand: npm run check
+    buildCommand: npm ci && npm run check
     startCommand: node server.mjs
     healthCheckPath: /healthz
     disk:

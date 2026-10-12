@@ -1,3 +1,4 @@
+import './lib/env.mjs';
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
@@ -6,8 +7,13 @@ import { resolve, join, extname, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AppError, requireValue, timestamp, parseGPS, positionAt, groupFrames } from './lib/domain.mjs';
 import { runtimeConfig, requestOriginAllowed, roles } from './lib/runtime.mjs';
+import {MODEL,modelReady} from './lib/model.mjs';
+import {detectVideo,stopDetectors} from './lib/detector.mjs';
+import {groupDetections} from './lib/detection.mjs';
+import { createAssistant } from './lib/assistant.mjs';
 
 const config = runtimeConfig();
+const detectorAvailable=process.env.DETECTOR_DISABLED!=='1' && modelReady();
 const root = dirname(fileURLToPath(import.meta.url));
 const data = resolve(process.env.DATA_DIR || join(root, 'data/private'));
 mkdirSync(join(data, 'files'), { recursive: true });
@@ -71,28 +77,42 @@ function metrics() {
     overdue:orders.filter(o=>o.status!=='closed'&&o.due_at&&Date.parse(o.due_at)<Date.now()).length,
     processing_ms:average(trips.filter(t=>t.completed_at).map(t=>Date.parse(t.completed_at)-Date.parse(t.processing_at))),
     capture_to_order_ms:average(orders.map(o=>Date.parse(o.created_at)-Date.parse(get('candidate',o.candidate_id).captured_at))),
-    usable_video_ratio:null,detector:'unavailable',origin:'test'};
+    usable_video_ratio:null,detector:detectorAvailable?MODEL.version:'unavailable',origin:candidates.some(c=>c.origin==='model')?'mixed':'test'};
 }
-function processTrip(id) {
-  let trip=get('trip',id); trip.status='processing';trip.processing_at=now();save('trip',trip);
+async function processTrip(id) {
+  let trip=get('trip',id);trip.status='processing';trip.processing_at=now();trip.progress=0;trip.processed_frames=0;save('trip',trip);
   try {
-    requireValue(trip.demo,'DETECTOR_UNAVAILABLE');
-    const frames=[1000,1600,7000,7600,13000].filter(ms=>ms/1000<trip.duration).map((ms,i)=>({id:`${id}-f${i}`,trip_id:id,time_ms:ms,frame_uri:'/demo-frame.svg',bbox:{x:.37,y:.56,width:.24,height:.18},class:'pothole',score:.72+i*.04,model_version:'demo-fixture-v1',origin:'test'}));
-    for(const frame of frames) save('frame',frame);
-    for(const [index,group] of groupFrames(frames).entries()) {
-      const candidateId=`${id}-c${index}`;
-      if(all('candidate').some(c=>c.id===candidateId)) continue;
-      const best=group.reduce((a,b)=>a.score>b.score?a:b), captured_at=new Date(Date.parse(trip.started_at)+best.time_ms).toISOString();
-      const pos=positionAt(trip.gps,captured_at);
-      save('candidate',{id:candidateId,trip_id:id,frame_detection_ids:group.map(f=>f.id),best_frame:best,captured_at,original_position:pos.position,edited_position:null,position_quality:pos.quality,review_status:'pending',linked_defect_id:null,origin:'test',history:[]});
+    // Published results are immutable on retry: preserve operator decisions and order links.
+    if(trip.result_complete){trip.status='ready';trip.progress=100;trip.error=null;save('trip',trip);return;}
+    let frames;
+    if(trip.demo){
+      frames=[1000,1600,7000,7600,13000].filter(ms=>ms/1000<trip.duration).map((ms,i)=>({id: id+'-f'+i,trip_id:id,time_ms:ms,frame_uri:'/demo-frame.svg',bbox:{x:.37,y:.56,width:.24,height:.18},class:'pothole',score:.72+i*.04,model_version:'demo-fixture-v1',origin:'test'}));
+    }else{
+      requireValue(detectorAvailable,'DETECTOR_UNAVAILABLE');
+      const result=await detectVideo({id,video:join(data,'files',id+'.mp4'),output:join(data,'files'),duration:trip.duration},progress=>{
+        trip.processed_frames=progress.processed_frames;trip.progress=progress.progress;save('trip',trip);
+      });
+      frames=result.frames;trip.processed_frames=result.processed_frames;trip.sampled_duration=result.sampled_duration;trip.model_version=MODEL.version;
     }
-    trip.status='ready';trip.completed_at=now();trip.error=null;
-  } catch(e) {trip.status='failed';trip.error=e.code || 'PROCESSING_FAILED';}
-  save('trip',trip);
+    db.exec('BEGIN IMMEDIATE');
+    try{
+      for(const frame of frames)save('frame',frame);
+      const groups=trip.demo?groupFrames(frames):groupDetections(frames);
+      for(const [index,group] of groups.entries()){
+        const candidateId=id+'-c'+index;
+        if(all('candidate').some(c=>c.id===candidateId))continue;
+        const best=group.reduce((a,b)=>a.score>b.score?a:b),captured_at=new Date(Date.parse(trip.started_at)+best.time_ms).toISOString(),pos=positionAt(trip.gps,captured_at);
+        save('candidate',{id:candidateId,trip_id:id,frame_detection_ids:group.map(f=>f.id),best_frame:best,captured_at,original_position:pos.position,edited_position:null,position_quality:pos.quality,review_status:'pending',linked_defect_id:null,origin:trip.demo?'test':'model',history:[]});
+      }
+      trip.status='ready';trip.progress=100;trip.result_complete=true;trip.detection_count=frames.length;trip.candidate_count=groups.length;trip.completed_at=now();trip.error=null;save('trip',trip);db.exec('COMMIT');
+    }catch(e){db.exec('ROLLBACK');throw e;}
+  }catch(e){trip.status='failed';trip.error=e.code||'PROCESSING_FAILED';save('trip',trip);}
 }
 for(const trip of all('trip')) if(['uploaded','processing'].includes(trip.status)) {trip.status='queued';save('trip',trip);}
-const timer=setInterval(()=>{const trip=all('trip').find(t=>t.status==='queued');if(trip)processTrip(trip.id);},500);
+let processing=false;
+const timer=setInterval(async()=>{if(processing)return;const trip=all('trip').find(t=>t.status==='queued');if(trip){processing=true;try{await processTrip(trip.id);}finally{processing=false;}}},500);
 const loginAttempts=new Map();
+const assistant=createAssistant({db,all,metrics});
 const server=http.createServer(async(req,res)=>{
  try {
   res.setHeader('X-Content-Type-Options','nosniff');
@@ -103,7 +123,7 @@ const server=http.createServer(async(req,res)=>{
     res.setHeader('Strict-Transport-Security','max-age=31536000');
   }
   if(path==='/healthz' && req.method==='GET') {db.prepare('SELECT 1').get();return json(res,200,{status:'ok'});}
-  if(path==='/api/config' && req.method==='GET') return json(res,200,{demoLogin:!config.remote,maxVideoMB:config.maxVideoMB});
+  if(path==='/api/config' && req.method==='GET') return json(res,200,{demoLogin:!config.remote,maxVideoMB:config.maxVideoMB,detector:{available:detectorAvailable,model:MODEL.version,sampleFPS:MODEL.sampleFPS,threshold:MODEL.threshold}});
   if(req.method!=='GET') requireValue(requestOriginAllowed(req,config),'FORBIDDEN',403);
   if(path==='/api/login' && req.method==='POST') {
     const b=await body(req);
@@ -118,6 +138,8 @@ const server=http.createServer(async(req,res)=>{
   }
   if(path.startsWith('/api/') || path.startsWith('/files/')) {
     const user=actor(req);
+    if(path==='/api/assistant' && req.method==='GET') return json(res,200,assistant.state(user.id));
+    if(path==='/api/assistant' && req.method==='POST') return json(res,200,await assistant.ask(user.id,req.headers['idempotency-key'],await body(req)));
     if(path==='/api/me') return json(res,200,{id:user.id,role:user.role});
     if(path==='/api/logout' && req.method==='POST') {db.prepare('DELETE FROM sessions WHERE token=?').run(/sid=([a-f0-9]+)/.exec(req.headers.cookie)?.[1]||'');res.setHeader('Set-Cookie','sid=; Path=/; Max-Age=0');return json(res,200,{});}
     if(path.startsWith('/files/') && req.method==='GET') {const name=path.slice(7);requireValue(/^[a-f0-9-]+\.(mp4|csv|png|jpg)$/.test(name),'NOT_FOUND',404);const file=join(data,'files',name);requireValue(existsSync(file),'NOT_FOUND',404);return stream(req,res,file,{'.mp4':'video/mp4','.csv':'text/csv','.png':'image/png','.jpg':'image/jpeg'}[extname(file)]);}
@@ -206,11 +228,11 @@ const server=http.createServer(async(req,res)=>{
     return json(res,200,result);
   }
   requireValue(req.method==='GET','NOT_FOUND',404);
-  const staticFiles={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/demo-frame.svg':'demo-frame.svg','/sample-gps.csv':'sample-gps.csv'};
+  const staticFiles={'/':'index.html','/assistant-ui.js':'assistant-ui.js','/app.js':'app.js','/style.css':'style.css','/demo-frame.svg':'demo-frame.svg','/sample-gps.csv':'sample-gps.csv'};
   requireValue(staticFiles[path],'NOT_FOUND',404);
   const file=join(root,'public',staticFiles[path]);return stream(req,res,file,{'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8','.css':'text/css; charset=utf-8','.svg':'image/svg+xml','.csv':'text/csv'}[extname(file)]);
  } catch(e) {if(!res.headersSent)json(res,e.status||500,{code:e.code||'SERVER_ERROR',message:e.code||'SERVER_ERROR',retryable:!e.status});else res.end();if(!e.status)console.error(e);}
 });
 server.listen(Number(process.env.PORT||3000),config.host,()=>console.log(`Road AI: ${config.origin || `http://${config.host}:${server.address().port}`} [port=${server.address().port}]`));
-function shutdown(){clearInterval(timer);server.close(()=>{db.close();process.exit(0);});}
+function shutdown(){clearInterval(timer);stopDetectors();server.close(()=>{db.close();process.exit(0);});}
 process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);

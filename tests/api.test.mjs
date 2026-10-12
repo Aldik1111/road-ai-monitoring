@@ -9,13 +9,19 @@ import {randomUUID} from 'node:crypto';
 
 test('upload → grouped review → unique order → assignment → evidence → return → acceptance; persistence and permissions',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'road-ai-test-'));let child,base;
- async function start(extra={}){child=spawn(process.execPath,['server.mjs'],{env:{...process.env,DATA_DIR:dir,PORT:'0',...extra},stdio:['ignore','pipe','pipe']});base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('server startup timeout')),10000);child.stdout.on('data',b=>{const m=b.toString().match(/port=(\d+)/);if(m){clearTimeout(timer);resolve('http://127.0.0.1:'+m[1]);}});child.on('error',reject);});}
+ async function start(extra={}){child=spawn(process.execPath,['server.mjs'],{env:{...process.env,ROAD_AI_SKIP_ENV:'1',DETECTOR_DISABLED:'1',OPENAI_API_KEY:'',DATA_DIR:dir,PORT:'0',...extra},stdio:['ignore','pipe','pipe']});base=await new Promise((resolve,reject)=>{const timer=setTimeout(()=>reject(new Error('server startup timeout')),10000);child.stdout.on('data',b=>{const m=b.toString().match(/port=(\d+)/);if(m){clearTimeout(timer);resolve('http://127.0.0.1:'+m[1]);}});child.on('error',reject);});}
  async function stop(){if(child && child.exitCode===null){const done=once(child,'exit');child.kill();await done;}}
  async function call(path,{method='GET',data,cookie,key=randomUUID()}={}){const r=await fetch(base+'/api'+path,{method,headers:{...(cookie?{cookie}:{}),...(method!=='GET'?{'Idempotency-Key':key}:{}),...(data&&!(data instanceof FormData)?{'Content-Type':'application/json'}:{})},body:data instanceof FormData?data:data?JSON.stringify(data):undefined});return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};}
  const login=async role=>(await call('/login',{method:'POST',data:{username:role,password:'RoadDemo2026!'}})).cookie;
  function trip(demo=true){const f=new FormData();f.set('video',new Blob([Buffer.from('0000ftypisom00000000')],{type:'video/mp4'}),'fixture.mp4');f.set('gps',new Blob([readFileSync('public/sample-gps.csv')]),'gps.csv');f.set('started_at','2026-10-12T09:00:00+05:00');f.set('duration','16');f.set('camera_description','Test camera');f.set('route_name','Test route');f.set('demo',String(demo));return f;}
  async function ready(id,cookie){for(let i=0;i<30;i++){const r=await call('/trips/'+id,{cookie});if(['ready','failed'].includes(r.data.status))return r.data;await new Promise(r=>setTimeout(r,100));}throw new Error('processing timeout');}
  try{await start();assert.equal((await call('/state')).status,401);const operator=await login('operator'),dispatcher=await login('dispatcher'),worker=await login('worker');
+ assert.equal((await call('/assistant')).status,401);
+ const chat=await call('/assistant',{cookie:operator});assert.equal(chat.data.configured,false);assert.deepEqual(chat.data.history,[]);
+ const disabled=await call('/assistant',{method:'POST',cookie:operator,data:{question:'Как загрузить видео?',language:'ru'}});assert.equal(disabled.status,503);assert.equal(disabled.data.code,'ASSISTANT_NOT_CONFIGURED');
+ assert.equal((await call('/assistant',{method:'POST',cookie:operator,data:null})).status,400);
+ const script=await fetch(base+'/assistant-ui.js');assert.equal(script.status,200);assert.match(script.headers.get('content-type'),/javascript/);
+ const envFile=await fetch(base+'/.env');assert.equal(envFile.status,404);
  const bad=trip();bad.set('gps',new Blob(['invalid']),'bad.csv');assert.equal((await call('/trips',{method:'POST',cookie:operator,data:bad})).status,400);
  const missing=trip();missing.set('started_at','2026-10-12T10:00:00+05:00');assert.equal((await call('/trips',{method:'POST',cookie:operator,data:missing})).data.code,'TIME_MISMATCH');
  const uploaded=await call('/trips',{method:'POST',data:trip(),cookie:operator});assert.equal(uploaded.status,200);const id=uploaded.data.id;assert.equal((await ready(id,operator)).status,'ready');

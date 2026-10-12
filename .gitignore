@@ -11,3 +11,6 @@ data/private/
 uploads/
 *.log
 .tools/
+
+models/*.onnx
+models/*.download
